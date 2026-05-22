@@ -196,8 +196,13 @@ fn main() {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("arch");
 
     let nasm_needed_for_arch = target_arch == "x86_64" || target_arch == "x86";
+    let simd_supported_for_arch = matches!(
+        target_arch.as_str(),
+        "x86_64" | "x86" | "arm" | "aarch64" | "mips" | "powerpc" | "powerpc64"
+    );
 
     let with_simd = cfg!(feature = "with_simd")
+        && simd_supported_for_arch
         && target_arch != "wasm32" // no WASM-SIMD support here
         && if nasm_needed_for_arch { nasm_supported() } else { gas_supported(&c) };
 
