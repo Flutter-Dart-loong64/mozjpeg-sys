@@ -196,10 +196,14 @@ fn main() {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("arch");
 
     let nasm_needed_for_arch = target_arch == "x86_64" || target_arch == "x86";
+    let loongarch_lsx_supported = target_arch != "loongarch64"
+        || compiler(&config_dir, &vendor)
+            .is_flag_supported("-mlsx")
+            .unwrap_or(false);
     let simd_supported_for_arch = matches!(
         target_arch.as_str(),
         "x86_64" | "x86" | "arm" | "aarch64" | "mips" | "powerpc" | "powerpc64"
-    );
+    ) || (target_arch == "loongarch64" && loongarch_lsx_supported);
 
     let with_simd = cfg!(feature = "with_simd")
         && simd_supported_for_arch
@@ -261,6 +265,21 @@ fn main() {
                 "powerpc" | "powerpc64" => {
                     c.flag_if_supported("-maltivec");
                     c.file("vendor/simd/powerpc/jsimd.c");
+                },
+                "loongarch64" => {
+                    let simd_dir = simd_dir.join("loongarch");
+                    let lasx_supported = compiler(&config_dir, &vendor)
+                        .is_flag_supported("-mlasx")
+                        .unwrap_or(false);
+
+                    c.include(&simd_dir);
+                    c.file("vendor/simd/loongarch/jsimd.c");
+                    if lasx_supported {
+                        c.define("JSIMD_LOONGARCH_LASX", Some("1"));
+                    }
+                    for obj in build_loongarch_simd(&config_dir, &vendor, lasx_supported) {
+                        c.object(obj);
+                    }
                 },
                 "arm" => {
                     c.file("vendor/simd/arm/aarch32/jchuff-neon.c");
@@ -340,6 +359,34 @@ fn build_gas(mut c: cc::Build, target_arch: &str, abi: &str) {
     c.flag("-xassembler-with-cpp");
 
     c.compile(&format!("mozjpegsimd{abi}"));
+}
+
+#[cfg(feature = "with_simd")]
+fn build_loongarch_simd(
+    config_dir: &Path,
+    vendor: &Path,
+    lasx_supported: bool,
+) -> Vec<PathBuf> {
+    let mut objects = Vec::new();
+    let mut c = compiler(config_dir, vendor);
+    c.include("vendor/simd");
+    c.include("vendor/simd/loongarch");
+    c.file("vendor/simd/loongarch/jccolor-lsx.c");
+    c.flag("-mlsx");
+    objects.extend(c.compile_intermediates());
+
+    if lasx_supported {
+        let mut c = compiler(config_dir, vendor);
+        c.include("vendor/simd");
+        c.include("vendor/simd/loongarch");
+        c.file("vendor/simd/loongarch/jccolor-lasx.c");
+        c.flag("-mlasx");
+        objects.extend(c.compile_intermediates());
+    } else {
+        println!("cargo:warning=LoongArch LASX flag is not supported; building LSX SIMD only");
+    }
+
+    objects
 }
 
 #[cfg(feature = "nasm_simd")]
