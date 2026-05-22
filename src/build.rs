@@ -74,22 +74,29 @@ fn main() {
 
     let target_pointer_width = env::var("CARGO_CFG_TARGET_POINTER_WIDTH").expect("target");
 
+    let jpeg16_files = &[
+        "vendor/jcapistd.c", "vendor/jccolor.c", "vendor/jcdiffct.c", "vendor/jclossls.c",
+        "vendor/jcmainct.c", "vendor/jcprepct.c", "vendor/jcsample.c", "vendor/jdapistd.c",
+        "vendor/jdcolor.c", "vendor/jddiffct.c", "vendor/jdlossls.c", "vendor/jdmainct.c",
+        "vendor/jdpostct.c", "vendor/jdsample.c", "vendor/jutils.c",
+    ];
+    let jpeg12_extra_files = &[
+        "vendor/jccoefct.c", "vendor/jcdctmgr.c", "vendor/jdcoefct.c", "vendor/jddctmgr.c",
+        "vendor/jdmerge.c", "vendor/jfdctfst.c", "vendor/jfdctint.c", "vendor/jidctflt.c",
+        "vendor/jidctfst.c", "vendor/jidctint.c", "vendor/jidctred.c", "vendor/jquant1.c",
+        "vendor/jquant2.c",
+    ];
     let files = &[
-        "vendor/jcapimin.c", "vendor/jcapistd.c", "vendor/jccoefct.c", "vendor/jccolor.c",
-        "vendor/jcdctmgr.c", "vendor/jcext.c", "vendor/jchuff.c", "vendor/jcinit.c",
-        "vendor/jcmainct.c", "vendor/jcmarker.c", "vendor/jcmaster.c", "vendor/jcomapi.c",
-        "vendor/jcparam.c", "vendor/jcphuff.c", "vendor/jcprepct.c", "vendor/jcsample.c",
-        "vendor/jctrans.c", "vendor/jdapimin.c", "vendor/jdapistd.c", "vendor/jdatadst.c",
-        "vendor/jdatasrc.c", "vendor/jdcoefct.c", "vendor/jdcolor.c", "vendor/jddctmgr.c",
-        "vendor/jdhuff.c", "vendor/jdinput.c", "vendor/jdmainct.c", "vendor/jdmarker.c",
-        "vendor/jdmaster.c", "vendor/jdmerge.c", "vendor/jdphuff.c", "vendor/jdpostct.c",
-        "vendor/jdsample.c", "vendor/jdtrans.c", "vendor/jerror.c", "vendor/jfdctflt.c",
-        "vendor/jfdctfst.c", "vendor/jfdctint.c", "vendor/jidctflt.c", "vendor/jidctfst.c",
-        "vendor/jidctint.c", "vendor/jidctred.c", "vendor/jmemmgr.c", "vendor/jmemnobs.c",
-        "vendor/jquant1.c", "vendor/jquant2.c", "vendor/jutils.c",
+        "vendor/jcapimin.c", "vendor/jcext.c", "vendor/jchuff.c", "vendor/jcinit.c",
+        "vendor/jclhuff.c", "vendor/jcmarker.c", "vendor/jcmaster.c", "vendor/jcomapi.c",
+        "vendor/jcparam.c", "vendor/jcphuff.c", "vendor/jctrans.c", "vendor/jdapimin.c",
+        "vendor/jdatadst.c", "vendor/jdatasrc.c", "vendor/jdhuff.c", "vendor/jdinput.c",
+        "vendor/jdlhuff.c", "vendor/jdmarker.c", "vendor/jdmaster.c", "vendor/jdphuff.c",
+        "vendor/jdtrans.c", "vendor/jerror.c", "vendor/jfdctflt.c", "vendor/jmemmgr.c",
+        "vendor/jmemnobs.c", "vendor/jpeg_nbits.c",
     ];
 
-    for file in files {
+    for &file in jpeg16_files.iter().chain(jpeg12_extra_files).chain(files) {
         assert!(Path::new(file).exists(), "C file is missing. Maybe you need to run `git submodule update --init`?");
         c.file(file);
     }
@@ -178,7 +185,9 @@ fn main() {
     writeln!(jconfig_h, r#"
         #define JPEG_LIB_VERSION {abi}
         #define LIBJPEG_TURBO_VERSION 0
+        #ifndef BITS_IN_JSAMPLE
         #define BITS_IN_JSAMPLE 8
+        #endif
         #define STDC_HEADERS 1
         #define NO_GETENV 1
         #define NO_PUTENV 1
@@ -219,8 +228,23 @@ fn main() {
     }
 
     let nasm_needed_for_arch = target_arch == "x86_64" || target_arch == "x86";
+    for obj in build_sample_precision_objects(&out_dir, &config_dir, &vendor, &target_arch, &target_feature, jpeg16_files, jpeg12_extra_files) {
+        c.object(obj);
+    }
+
+    let loongarch_lsx_supported = if target_arch == "loongarch64" {
+        let (probe, _) = compiler(&config_dir, &vendor, &target_arch, &target_feature);
+        probe.is_flag_supported("-mlsx").unwrap_or(false)
+    } else {
+        true
+    };
+    let simd_supported_for_arch = matches!(
+        target_arch.as_str(),
+        "x86_64" | "x86" | "arm" | "aarch64" | "mips" | "powerpc" | "powerpc64"
+    ) || (target_arch == "loongarch64" && loongarch_lsx_supported);
 
     let with_simd = cfg!(feature = "with_simd")
+        && simd_supported_for_arch
         && target_arch != "wasm32" // no WASM-SIMD support here
         && if nasm_needed_for_arch { nasm_supported() } else { gas_supported(&c) };
 
@@ -230,7 +254,7 @@ fn main() {
         if with_simd {
             let simd_dir = vendor.join("simd");
             c.include(&simd_dir);
-            if env::var_os("MOZJPEG_ALLOW_PROC_FOPEN").is_none_or(|v| v == "0") {
+            if env::var_os("MOZJPEG_ALLOW_PROC_FOPEN").map_or(true, |v| v == "0") {
                 c.define("NO_PROC_FOPEN", Some("1")); // open /proc/cpuinfo breaks my seccomp
             }
 
@@ -280,6 +304,20 @@ fn main() {
                 "powerpc" | "powerpc64" => {
                     c.flag_if_supported("-maltivec");
                     c.file("vendor/simd/powerpc/jsimd.c");
+                },
+                "loongarch64" => {
+                    let simd_dir = simd_dir.join("loongarch");
+                    let (probe, _) = compiler(&config_dir, &vendor, &target_arch, &target_feature);
+                    let lasx_supported = probe.is_flag_supported("-mlasx").unwrap_or(false);
+
+                    c.include(&simd_dir);
+                    c.file("vendor/simd/loongarch/jsimd.c");
+                    if lasx_supported {
+                        c.define("JSIMD_LOONGARCH_LASX", Some("1"));
+                    }
+                    for obj in build_loongarch_simd(&config_dir, &vendor, &target_arch, &target_feature, lasx_supported) {
+                        c.object(obj);
+                    }
                 },
                 "arm" => {
                     c.file("vendor/simd/arm/aarch32/jchuff-neon.c");
@@ -346,6 +384,40 @@ fn nasm_supported() -> bool {
     }
 }
 
+fn build_sample_precision_objects(
+    out_dir: &Path,
+    config_dir: &Path,
+    vendor: &Path,
+    target_arch: &str,
+    target_feature: &str,
+    jpeg16_files: &[&str],
+    jpeg12_extra_files: &[&str],
+) -> Vec<PathBuf> {
+    let mut objects = Vec::new();
+
+    let jpeg12_out = out_dir.join("jpeg12");
+    fs::create_dir_all(&jpeg12_out).expect("jpeg12 object dir");
+    let (mut c, _) = compiler(config_dir, vendor, target_arch, target_feature);
+    c.out_dir(jpeg12_out);
+    c.define("BITS_IN_JSAMPLE", Some("12"));
+    for &file in jpeg16_files.iter().chain(jpeg12_extra_files) {
+        c.file(file);
+    }
+    objects.extend(c.compile_intermediates());
+
+    let jpeg16_out = out_dir.join("jpeg16");
+    fs::create_dir_all(&jpeg16_out).expect("jpeg16 object dir");
+    let (mut c, _) = compiler(config_dir, vendor, target_arch, target_feature);
+    c.out_dir(jpeg16_out);
+    c.define("BITS_IN_JSAMPLE", Some("16"));
+    for &file in jpeg16_files {
+        c.file(file);
+    }
+    objects.extend(c.compile_intermediates());
+
+    objects
+}
+
 #[cfg(feature = "with_simd")]
 fn build_gas(mut c: cc::Build, target_arch: &str, abi: &str) {
     c.file(match target_arch {
@@ -359,6 +431,41 @@ fn build_gas(mut c: cc::Build, target_arch: &str, abi: &str) {
     c.flag("-xassembler-with-cpp");
 
     c.compile(&format!("mozjpegsimd{abi}"));
+}
+
+#[cfg(feature = "with_simd")]
+fn build_loongarch_simd(
+    config_dir: &Path,
+    vendor: &Path,
+    target_arch: &str,
+    target_feature: &str,
+    lasx_supported: bool,
+) -> Vec<PathBuf> {
+    let mut objects = Vec::new();
+    let (mut c, _) = compiler(config_dir, vendor, target_arch, target_feature);
+    c.include("vendor/simd");
+    c.include("vendor/simd/loongarch");
+    c.file("vendor/simd/loongarch/jccolor-lsx.c");
+    c.file("vendor/simd/loongarch/jcsample-lsx.c");
+    c.file("vendor/simd/loongarch/jdsample-lsx.c");
+    c.file("vendor/simd/loongarch/jdct-lsx.c");
+    c.flag("-mlsx");
+    objects.extend(c.compile_intermediates());
+
+    if lasx_supported {
+        let (mut c, _) = compiler(config_dir, vendor, target_arch, target_feature);
+        c.include("vendor/simd");
+        c.include("vendor/simd/loongarch");
+        c.file("vendor/simd/loongarch/jccolor-lasx.c");
+        c.file("vendor/simd/loongarch/jcsample-lasx.c");
+        c.file("vendor/simd/loongarch/jdsample-lasx.c");
+        c.flag("-mlasx");
+        objects.extend(c.compile_intermediates());
+    } else {
+        println!("cargo:warning=LoongArch LASX flag is not supported; building LSX SIMD only");
+    }
+
+    objects
 }
 
 #[cfg(feature = "nasm_simd")]
