@@ -348,7 +348,11 @@ fn main() {
     drop(jconfig_h); // close the file
 
     if !with_simd {
-        c.file("vendor/jsimd_none.c");
+        if target_arch == "loongarch64" {
+            c.file("vendor/simd/loongarch/jsimd_none_loongarch.c");
+        } else {
+            c.file("vendor/jsimd_none.c");
+        }
     }
 
     c.compile(&format!("mozjpeg{abi}{simd_abi}"));
